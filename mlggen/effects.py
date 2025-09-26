@@ -1,3 +1,4 @@
+# Updated effects module: works with or without Pillow installed.
 import random
 import os
 import numpy as np
@@ -5,31 +6,52 @@ from moviepy.editor import (
     CompositeVideoClip, ImageClip, AudioFileClip, concatenate_videoclips,
     VideoFileClip, afx, vfx, TextClip
 )
-from PIL import Image as PILImage, ImageDraw, ImageFont
 
-from .pil_compat import RESAMPLE_LANCZOS  # compatibility for Pillow resampling
+# Try to import Pillow (PIL). If it's not installed, fall back to moviepy-only behavior.
+try:
+    from PIL import Image as PILImage, ImageDraw, ImageFont
+    HAS_PIL = True
+except Exception:
+    PILImage = None
+    ImageDraw = None
+    ImageFont = None
+    HAS_PIL = False
 
 def safe_text_clip(txt, fontsize=48, color='white', duration=2, size=(640, 360)):
     """
-    Return an ImageClip with text using Pillow to avoid ImageMagick dependency.
+    Return an ImageClip with text.
+    - If Pillow is available, use it to draw text on a transparent image.
+    - Else try moviepy.TextClip (requires ImageMagick).
+    - Else return a transparent placeholder clip of the requested size and duration.
     """
-    # Create a PIL image with transparent background
-    img = PILImage.new("RGBA", size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    try:
-        # Try to use a common font; on Windows use Arial default fallback
-        font = ImageFont.truetype("arial.ttf", fontsize)
-    except Exception:
-        font = ImageFont.load_default()
+    if HAS_PIL:
+        # Pillow-based text rendering (no ImageMagick required)
+        img = PILImage.new("RGBA", size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.truetype("arial.ttf", fontsize)
+        except Exception:
+            font = ImageFont.load_default()
 
-    w, h = draw.textsize(txt, font=font)
-    pos = ((size[0] - w) // 2, (size[1] - h) // 2)
-    # Outline for readability
-    outline_color = "black"
-    for ox, oy in [(-2, -2), (-2, 2), (2, -2), (2, 2)]:
-        draw.text((pos[0] + ox, pos[1] + oy), txt, font=font, fill=outline_color)
-    draw.text(pos, txt, font=font, fill=color)
-    return ImageClip(img).set_duration(duration)
+        # center text
+        w, h = draw.textsize(txt, font=font)
+        pos = ((size[0] - w) // 2, (size[1] - h) // 2)
+        outline_color = "black"
+        for ox, oy in [(-2, -2), (-2, 2), (2, -2), (2, 2)]:
+            draw.text((pos[0] + ox, pos[1] + oy), txt, font=font, fill=outline_color)
+        draw.text(pos, txt, font=font, fill=color)
+        return ImageClip(np.array(img)).set_duration(duration)
+    else:
+        # Try TextClip (ImageMagick) first
+        try:
+            txtclip = TextClip(txt, fontsize=fontsize, color=color, stroke_color='black', stroke_width=2)
+            txtclip = txtclip.set_duration(duration)
+            return txtclip
+        except Exception:
+            # Fallback: transparent placeholder clip (no text)
+            w, h = size
+            arr = np.zeros((h, w, 4), dtype=np.uint8)  # fully transparent RGBA
+            return ImageClip(arr).set_duration(duration)
 
 def flash(clip, flashes=6, color=(255, 255, 255)):
     """
@@ -44,9 +66,12 @@ def flash(clip, flashes=6, color=(255, 255, 255)):
     return CompositeVideoClip([clip] + flashes_clips).set_duration(clip.duration)
 
 def make_solid_image(w, h, color):
-    from PIL import Image
-    img = Image.new("RGB", (w, h), color)
-    return img
+    # Use numpy to create a solid-color frame (avoid PIL dependency here)
+    arr = np.zeros((h, w, 3), dtype=np.uint8)
+    arr[..., 0] = color[0]
+    arr[..., 1] = color[1]
+    arr[..., 2] = color[2]
+    return arr
 
 def quick_cut(clips, target_duration=None):
     """
@@ -76,40 +101,52 @@ def quick_cut(clips, target_duration=None):
     return shots
 
 def zoom_effect(clip, max_zoom=1.5):
-    # simple progressive resize crop zoom
-    w, h = clip.size
-    def fl(gf, t):
-        frame = gf(t)
-        zoom = 1 + 0.4 * random.random()
-        # moviepy's vfx.resize accepts factors
-        return frame
     # fallback: use resize with small factor change
     factor = random.uniform(1.08, max_zoom)
     return clip.fx(vfx.resize, factor)
 
 def overlay_image(clip, image_path, pos=('center', 'center'), duration=None, opacity=0.95):
     """
-    Load overlay image via PIL and resize it using a compatibility resample value.
-    This avoids using deprecated PIL attributes like Image.ANTIALIAS.
+    Overlay an image onto clip.
+
+    Behavior:
+    - If Pillow is available, use PIL to open and resize the overlay with good resampling.
+    - If Pillow is not available, fall back to moviepy.ImageClip(...) and .resize(...) which uses ffmpeg.
     """
+    if not image_path:
+        return clip
     if not os.path.exists(image_path):
         return clip
+
     try:
-        pil_img = PILImage.open(image_path).convert("RGBA")
-        # compute new size keeping aspect ratio, target height is fraction of clip height
-        target_h = int(clip.h * 0.35)
-        ow, oh = pil_img.size
-        if oh == 0:
-            return clip
-        scale = target_h / float(oh)
-        new_w = max(1, int(ow * scale))
-        new_h = max(1, int(oh * scale))
-        pil_img = pil_img.resize((new_w, new_h), resample=RESAMPLE_LANCZOS)
-        img_clip = ImageClip(np.array(pil_img)).set_duration(duration or clip.duration).set_opacity(opacity)
-        img_clip = img_clip.set_pos(pos)
-        return CompositeVideoClip([clip, img_clip.set_duration(clip.duration)])
+        if HAS_PIL:
+            # Use Pillow to load and resize the overlay (keeps control without depending on ffmpeg resizing)
+            pil_img = PILImage.open(image_path).convert("RGBA")
+            target_h = int(clip.h * 0.35)
+            ow, oh = pil_img.size
+            if oh == 0:
+                return clip
+            scale = target_h / float(oh)
+            new_w = max(1, int(ow * scale))
+            new_h = max(1, int(oh * scale))
+            # Use Pillow's LANCZOS (or available equivalent) for good quality
+            try:
+                resample = PILImage.Resampling.LANCZOS
+            except Exception:
+                resample = getattr(PILImage, "LANCZOS", getattr(PILImage, "ANTIALIAS", PILImage.BICUBIC))
+            pil_img = pil_img.resize((new_w, new_h), resample=resample)
+            img_clip = ImageClip(np.array(pil_img)).set_duration(duration or clip.duration).set_opacity(opacity)
+            img_clip = img_clip.set_pos(pos)
+            return CompositeVideoClip([clip, img_clip.set_duration(clip.duration)])
+        else:
+            # No Pillow: load with moviepy and let moviepy/ffmpeg handle resizing
+            img = ImageClip(image_path).set_duration(duration or clip.duration).set_opacity(opacity)
+            # moviepy resize supports keyword height
+            img = img.resize(height=int(clip.h * 0.35))
+            img = img.set_pos(pos)
+            return CompositeVideoClip([clip, img.set_duration(clip.duration)])
     except Exception:
-        # Fallback to moviepy direct ImageClip from path if something goes wrong
+        # Last-resort fallback: try moviepy.ImageClip path
         try:
             img = ImageClip(image_path).set_duration(duration or clip.duration).set_opacity(opacity)
             img = img.resize(height=int(clip.h * 0.35))
@@ -119,11 +156,12 @@ def overlay_image(clip, image_path, pos=('center', 'center'), duration=None, opa
             return clip
 
 def add_text_overlay(clip, text, fontsize=48, duration=1.5):
-    # Try TextClip first (may require ImageMagick)
+    # Try TextClip (ImageMagick) first
     try:
         txtclip = TextClip(text, fontsize=fontsize, color='white', stroke_color='black', stroke_width=2)
         txtclip = txtclip.set_duration(duration).set_pos(("center", "bottom"))
     except Exception:
+        # fall back to safe_text_clip which handles both PIL and non-PIL fallback
         txtclip = safe_text_clip(text, fontsize=fontsize, duration=duration, size=clip.size).set_pos(("center", "bottom"))
     return CompositeVideoClip([clip, txtclip.set_start(random.uniform(0, max(0, clip.duration - duration))).set_opacity(0.9)])
 
@@ -132,11 +170,7 @@ def add_airhorn(clip, airhorn_path, when=0.1, vol=1.0):
         return clip
     try:
         a = AudioFileClip(airhorn_path).volumex(vol)
-        # Combine clip audio with airhorn at `when` seconds into clip
-        base = clip.audio if clip.audio else None
-        combined = afx.audio_fadein(a, 0.01)  # small fade
         # We'll place the airhorn in the final composition rather than modify each clip here.
-        # Return the original clip and the airhorn audio to be mixed later by the caller.
         return clip, (a, when)
     except Exception:
         return clip
@@ -196,6 +230,4 @@ def make_mlg_clip_sequence(video_paths, assets, target_duration=12, intensity="m
             final = final.set_audio(music)
         except Exception:
             pass
-    # Mix collected airhorns on top (simple approach: overlay at start times)
-    # For more advanced mixing, you can build a CompositeAudioClip
     return final
