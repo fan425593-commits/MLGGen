@@ -1,4 +1,3 @@
-```markdown
 # MLGGen
 
 Small MLG-style video generator (Windows 8.1 friendly) using Python + moviepy 1.0.1.
