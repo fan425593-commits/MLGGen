@@ -1,17 +1,20 @@
 import random
 import os
+import numpy as np
 from moviepy.editor import (
     CompositeVideoClip, ImageClip, AudioFileClip, concatenate_videoclips,
     VideoFileClip, afx, vfx, TextClip
 )
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image as PILImage, ImageDraw, ImageFont
+
+from .pil_compat import RESAMPLE_LANCZOS  # compatibility for Pillow resampling
 
 def safe_text_clip(txt, fontsize=48, color='white', duration=2, size=(640, 360)):
     """
     Return an ImageClip with text using Pillow to avoid ImageMagick dependency.
     """
     # Create a PIL image with transparent background
-    img = Image.new("RGBA", size, (0, 0, 0, 0))
+    img = PILImage.new("RGBA", size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     try:
         # Try to use a common font; on Windows use Arial default fallback
@@ -85,12 +88,35 @@ def zoom_effect(clip, max_zoom=1.5):
     return clip.fx(vfx.resize, factor)
 
 def overlay_image(clip, image_path, pos=('center', 'center'), duration=None, opacity=0.95):
+    """
+    Load overlay image via PIL and resize it using a compatibility resample value.
+    This avoids using deprecated PIL attributes like Image.ANTIALIAS.
+    """
     if not os.path.exists(image_path):
         return clip
-    img = ImageClip(image_path).set_duration(duration or clip.duration).set_opacity(opacity)
-    img = img.resize(height=int(clip.h * 0.35))  # scale to fraction of height
-    img = img.set_pos(pos)
-    return CompositeVideoClip([clip, img.set_duration(clip.duration)])
+    try:
+        pil_img = PILImage.open(image_path).convert("RGBA")
+        # compute new size keeping aspect ratio, target height is fraction of clip height
+        target_h = int(clip.h * 0.35)
+        ow, oh = pil_img.size
+        if oh == 0:
+            return clip
+        scale = target_h / float(oh)
+        new_w = max(1, int(ow * scale))
+        new_h = max(1, int(oh * scale))
+        pil_img = pil_img.resize((new_w, new_h), resample=RESAMPLE_LANCZOS)
+        img_clip = ImageClip(np.array(pil_img)).set_duration(duration or clip.duration).set_opacity(opacity)
+        img_clip = img_clip.set_pos(pos)
+        return CompositeVideoClip([clip, img_clip.set_duration(clip.duration)])
+    except Exception:
+        # Fallback to moviepy direct ImageClip from path if something goes wrong
+        try:
+            img = ImageClip(image_path).set_duration(duration or clip.duration).set_opacity(opacity)
+            img = img.resize(height=int(clip.h * 0.35))
+            img = img.set_pos(pos)
+            return CompositeVideoClip([clip, img.set_duration(clip.duration)])
+        except Exception:
+            return clip
 
 def add_text_overlay(clip, text, fontsize=48, duration=1.5):
     # Try TextClip first (may require ImageMagick)
